@@ -29,6 +29,17 @@ class RenderAudioTests(unittest.TestCase):
         with patch.object(render.subprocess, "run", return_value=result):
             self.assertIsNone(render.measure_loudness(Path("silent.mp4")))
 
+    def test_unmeasurable_audio_is_preserved_in_final_and_preview(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "input.mp4"
+            source.write_bytes(b"silent media")
+            for preview in (False, True):
+                output = Path(temp) / f"output-{preview}.mp4"
+                with patch.object(render, "measure_loudness", return_value=None), patch.object(render.subprocess, "run") as run:
+                    self.assertTrue(render.apply_loudnorm_two_pass(source, output, preview=preview))
+                self.assertEqual(output.read_bytes(), source.read_bytes())
+                run.assert_not_called()
+
     def _concat_command(self, segment_count):
         with tempfile.TemporaryDirectory() as temp:
             edit_dir = Path(temp)

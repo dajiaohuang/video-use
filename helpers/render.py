@@ -25,6 +25,7 @@ import argparse
 import json
 import math
 import re
+import shutil
 import subprocess
 import sys
 from fractions import Fraction
@@ -594,12 +595,20 @@ def apply_loudnorm_two_pass(
 ) -> bool:
     """Run two-pass loudnorm on input_path, write normalized copy to output_path.
 
-    Returns True on success, False if measurement failed (caller should fall
-    back to copying the input unchanged).
+    Returns True after writing the output. If no finite measurement is available,
+    preserves the input unchanged rather than passing silence through loudnorm.
 
-    In preview mode, skips the measurement pass and uses a one-pass approximation
-    for speed. Final mode always does the proper two-pass.
+    Preview mode uses a one-pass approximation after checking the measurement;
+    final mode supplies the measured values to the normalization pass.
     """
+    # Silence has no finite loudness target, and one-pass loudnorm can also
+    # produce non-finite samples. Preserve the input when measurement is unavailable.
+    measurement = measure_loudness(input_path)
+    if measurement is None:
+        print("  loudnorm unavailable — preserving input audio unchanged")
+        shutil.copyfile(input_path, output_path)
+        return True
+
     if preview:
         # One-pass approximation — faster, slightly less accurate.
         filter_str = f"loudnorm=I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}"
@@ -618,11 +627,6 @@ def apply_loudnorm_two_pass(
 
     # Full two-pass
     print(f"  loudnorm pass 1: measuring {input_path.name}")
-    measurement = measure_loudness(input_path)
-    if measurement is None:
-        print("  loudnorm measurement failed — falling back to 1-pass")
-        return apply_loudnorm_two_pass(input_path, output_path, preview=True)
-
     print(f"    measured: I={measurement['input_i']} LUFS  "
           f"TP={measurement['input_tp']}  LRA={measurement['input_lra']}")
 
