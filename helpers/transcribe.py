@@ -2,7 +2,7 @@
 
 Extracts mono 16kHz audio via ffmpeg, uploads to Scribe with verbatim +
 diarize + audio events + word-level timestamps, writes the full response
-to <edit_dir>/transcripts/<video_stem>.json.
+to <edit_dir>/transcripts/<video_stem>.<source-hash>[.trackN].json.
 
 Cached: if the output file already exists, the upload is skipped.
 
@@ -21,6 +21,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -124,21 +125,41 @@ def _source_fingerprint(video: Path) -> dict:
     }
 
 
+def _hashed_transcript_paths(transcripts_dir: Path, name: str) -> list[Path]:
+    """Find generated transcript names by literal stem and valid suffix."""
+    if not transcripts_dir.is_dir():
+        return []
+    prefix = f"{name}."
+    return sorted(
+        (
+            path for path in transcripts_dir.iterdir()
+            if path.is_file()
+            and path.name.startswith(prefix)
+            and re.fullmatch(
+                r"[0-9a-f]{8}(?:\.track\d+)?\.json",
+                path.name[len(prefix):],
+            )
+        ),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+
+
 def _source_matches(transcript_path: Path, video: Path) -> bool:
-    """Return True if the existing transcript was produced from the current
-    source video (same path, mtime, size). Transcripts without a _source key
-    (written by older versions) are accepted if the path stem matches."""
+    """Return True when the saved source fingerprint still matches."""
     try:
         data = json.loads(transcript_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
     meta = data.get("_source") if isinstance(data, dict) else None
-    if not meta or not isinstance(meta, dict):
-        return True
+    if not isinstance(meta, dict):
+        return False
     fp = _source_fingerprint(video)
-    return (meta.get("path") == fp["path"]
-            and meta.get("mtime_ns") == fp["mtime_ns"]
-            and meta.get("size") == fp["size"])
+    return (
+        meta.get("path") == fp["path"]
+        and meta.get("mtime_ns") == fp["mtime_ns"]
+        and meta.get("size") == fp["size"]
+    )
 
 
 def transcript_path(edit_dir: Path, video: Path, audio_track: int = 0) -> Path:
@@ -147,8 +168,8 @@ def transcript_path(edit_dir: Path, video: Path, audio_track: int = 0) -> Path:
     Names include a short hash of the resolved parent directory so two videos
     with the same stem in different directories (e.g. takes/A/clip.mp4 and
     takes/B/clip.mp4) do not collide during batch transcription. Track 0 keeps
-    a stem-only alias if a legacy stem-only file already exists and matches
-    the source, so transcripts made before this change stay valid.
+    an unambiguous legacy stem-only file when it has no source fingerprint,
+    so older transcripts remain usable without cross-source collisions.
     """
     track_suffix = "" if audio_track == 0 else f".track{audio_track}"
     parent_hash = hashlib.sha1(str(video.resolve()).encode("utf-8")).hexdigest()[:8]
@@ -156,33 +177,47 @@ def transcript_path(edit_dir: Path, video: Path, audio_track: int = 0) -> Path:
 
 
 def _legacy_transcript_path(edit_dir: Path, video: Path, audio_track: int = 0) -> Path | None:
-    """Return the pre-hash transcript path if a matching legacy file exists."""
+    """Return a safe legacy transcript path, if one can be identified."""
     track_suffix = "" if audio_track == 0 else f".track{audio_track}"
-    legacy = edit_dir / "transcripts" / f"{video.stem}{track_suffix}.json"
-    if legacy.exists() and _source_matches(legacy, video):
+    transcripts_dir = edit_dir / "transcripts"
+    legacy = transcripts_dir / f"{video.stem}{track_suffix}.json"
+    if not legacy.is_file():
+        return None
+
+    try:
+        data = json.loads(legacy.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(data, dict) and data.get("_source") is not None:
+        return legacy if _source_matches(legacy, video) else None
+
+    # An un-fingerprinted file in a custom shared edit directory cannot be
+    # tied to this source. The default per-video edit directory is the only
+    # legacy location whose identity is implied by the existing layout.
+    if edit_dir.resolve() != video.resolve().parent / "edit":
+        return None
+    # A hashed same-stem result proves the legacy name is ambiguous.
+    if _hashed_transcript_paths(transcripts_dir, video.stem):
+        return None
+    return legacy
+
+
+def cached_transcript_path(
+    edit_dir: Path,
+    video: Path,
+    audio_track: int = 0,
+    allow_legacy: bool = True,
+) -> Path | None:
+    """Return a cached result only when it belongs to the current source."""
+    legacy = (
+        _legacy_transcript_path(edit_dir, video, audio_track)
+        if allow_legacy
+        else None
+    )
+    if legacy is not None:
         return legacy
-    return None
-
-
-def resolve_transcript(transcripts_dir: Path, name: str) -> Path | None:
-    """Find a transcript JSON by logical name (video stem or source key).
-
-    Tries in order:
-      1. <name>.json (legacy plain name — produced before hashing was added)
-      2. <name>.<8-hex-hash>*.json  (new disambiguated name — any parent hash)
-
-    Returns the first match or None. When multiple hashed files exist for the
-    same stem (same-named videos in different directories), the most recently
-    modified wins; this mirrors how a human would pick when the EDL's source
-    key is ambiguous.
-    """
-    plain = transcripts_dir / f"{name}.json"
-    if plain.exists():
-        return plain
-    matches = sorted(transcripts_dir.glob(f"{name}.*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if matches:
-        return matches[0]
-    return None
+    output = transcript_path(edit_dir, video, audio_track)
+    return output if output.is_file() and _source_matches(output, video) else None
 
 
 def transcribe_one(
@@ -193,6 +228,7 @@ def transcribe_one(
     num_speakers: int | None = None,
     verbose: bool = True,
     audio_track: int = 0,
+    allow_legacy_cache: bool = True,
 ) -> Path:
     """Transcribe a single video. Returns path to transcript JSON.
 
@@ -204,18 +240,15 @@ def transcribe_one(
     transcripts_dir = edit_dir / "transcripts"
     transcripts_dir.mkdir(parents=True, exist_ok=True)
 
-    legacy = _legacy_transcript_path(edit_dir, video, audio_track)
-    if legacy is not None:
+    cached = cached_transcript_path(
+        edit_dir, video, audio_track, allow_legacy=allow_legacy_cache
+    )
+    if cached is not None:
         if verbose:
-            print(f"cached: {legacy.name}")
-        return legacy
+            print(f"cached: {cached.name}")
+        return cached
 
     out_path = transcript_path(edit_dir, video, audio_track)
-
-    if out_path.exists() and _source_matches(out_path, video):
-        if verbose:
-            print(f"cached: {out_path.name}")
-        return out_path
 
     if out_path.exists() and verbose:
         print(f"  source changed — re-transcribing {video.name}")

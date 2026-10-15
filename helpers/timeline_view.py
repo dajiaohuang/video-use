@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -116,13 +117,24 @@ def compute_envelope(video: Path, start: float, end: float, samples: int = 2000)
 
 
 def _resolve_transcript(transcripts_dir: Path, stem: str) -> Path | None:
-    """Find a transcript by stem, trying plain name first then hashed name."""
+    """Find a transcript by literal stem and generated hash suffix."""
     plain = transcripts_dir / f"{stem}.json"
     if plain.exists():
         return plain
+    if not transcripts_dir.is_dir():
+        return None
+    prefix = f"{stem}."
     matches = sorted(
-        transcripts_dir.glob(f"{stem}.*.json"),
-        key=lambda p: p.stat().st_mtime,
+        (
+            path for path in transcripts_dir.iterdir()
+            if path.is_file()
+            and path.name.startswith(prefix)
+            and re.fullmatch(
+                r"[0-9a-f]{8}(?:\.track\d+)?\.json",
+                path.name[len(prefix):],
+            )
+        ),
+        key=lambda path: path.stat().st_mtime_ns,
         reverse=True,
     )
     return matches[0] if matches else None

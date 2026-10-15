@@ -408,18 +408,24 @@ PUNCT_BREAK = set(".,!?;:")
 
 
 def _find_transcript(transcripts_dir: Path, name: str) -> Path | None:
-    """Resolve a transcript JSON by logical name.
-
-    Looks for <name>.json (legacy) first, then <name>.<hash>*.json (the
-    disambiguated names produced by transcribe.py to avoid same-stem
-    collisions across directories).
-    """
+    """Resolve a transcript by literal name and generated hash suffix."""
     plain = transcripts_dir / f"{name}.json"
     if plain.exists():
         return plain
+    if not transcripts_dir.is_dir():
+        return None
+    prefix = f"{name}."
     matches = sorted(
-        transcripts_dir.glob(f"{name}.*.json"),
-        key=lambda p: p.stat().st_mtime,
+        (
+            path for path in transcripts_dir.iterdir()
+            if path.is_file()
+            and path.name.startswith(prefix)
+            and re.fullmatch(
+                r"[0-9a-f]{8}(?:\.track\d+)?\.json",
+                path.name[len(prefix):],
+            )
+        ),
+        key=lambda path: path.stat().st_mtime_ns,
         reverse=True,
     )
     return matches[0] if matches else None
