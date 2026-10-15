@@ -3,7 +3,7 @@
 Implements the HEURISTICS render pipeline in the correct order:
 
   1. Per-segment extract with color grade + 30ms audio fades baked in
-  2. Lossless -c copy concat into base.mp4
+  2. Stream-copy video and re-encode AAC audio during concat into base.mp4
   3. If overlays or subtitles: single filter graph that overlays animations
      (with PTS shift so frame 0 lands at the overlay window start)
      and applies `subtitles` filter LAST → final.mp4
@@ -294,7 +294,7 @@ def extract_segment(
         preset, crf = "fast", "20"
 
     # Frame rate: use the rate the caller resolved once for the whole render
-    # (every segment must share it — concat -c copy in Rule 2 requires a uniform
+    # (every segment must share it — Rule 2 stream-copies video and requires a uniform
     # frame rate). When called standalone with no rate, preserve this source's
     # own rate; fall back to 24 only if it can't be probed.
     out_rate = rate if rate is not None else (probe_source_fps(source) or "24")
@@ -308,7 +308,7 @@ def extract_segment(
         "-af", af,
         "-c:v", "libx264", "-preset", preset, "-crf", crf,
         "-pix_fmt", "yuv420p", "-r", out_rate,
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-c:a", "aac", "-b:a", AAC_BITRATE, "-ar", AAC_SAMPLE_RATE,
         "-movflags", "+faststart",
         str(out_path),
     ]
@@ -340,7 +340,7 @@ def extract_all_segments(
     sources = edl["sources"]
 
     # Resolve ONE output frame rate for the entire render and apply it to every
-    # segment. The lossless concat (Rule 2, `-c copy`) requires all segments to
+    # segment. The video stream-copy concat (Rule 2) requires all segments to
     # share a frame rate; probing per-segment would diverge for multi-source
     # EDLs that mix rates (e.g. a 30fps and a 60fps source) and break the concat.
     # Explicit --fps wins; otherwise preserve the first source's rate.
@@ -380,29 +380,32 @@ def extract_all_segments(
     return seg_paths
 
 
-# -------- Lossless concat ----------------------------------------------------
+# -------- Video stream-copy / continuous-audio concat -----------------------
 
 
 def concat_segments(segment_paths: list[Path], out_path: Path, edit_dir: Path) -> None:
     """Concat via the concat demuxer.
 
-    Video is stream-copied (lossless). Audio is re-encoded to a single
-    continuous AAC stream because each extracted segment carries its own
-    encoder priming/padding samples; with `-c copy` those misalign at every
-    joint and produce an audible click (~100 ms after the boundary).
-    Re-encoding audio removes the priming mismatch while keeping video
-    lossless.
+    Video is stream-copied (lossless). For multiple segments, audio is
+    re-encoded to one continuous AAC stream because independently encoded
+    segments carry priming/padding samples that can click at joins. A single
+    segment has no join, so its AAC stream is copied without another lossy pass.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     concat_list = edit_dir / "_concat.txt"
     concat_list.write_text("".join(f"file '{p.resolve()}'\n" for p in segment_paths), encoding="utf-8")
 
+    audio_codec = (
+        ["-c:a", "copy"]
+        if len(segment_paths) == 1
+        else ["-c:a", "aac", "-b:a", AAC_BITRATE, "-ar", AAC_SAMPLE_RATE]
+    )
     cmd = [
         "ffmpeg", "-y",
         "-f", "concat", "-safe", "0",
         "-i", str(concat_list),
         "-c:v", "copy",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        *audio_codec,
         "-movflags", "+faststart",
         str(out_path),
     ]
@@ -539,6 +542,8 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
 LOUDNORM_I = -14.0
 LOUDNORM_TP = -1.0
 LOUDNORM_LRA = 11.0
+AAC_BITRATE = "192k"
+AAC_SAMPLE_RATE = "48000"
 
 
 def measure_loudness(video_path: Path) -> dict[str, str] | None:
@@ -603,7 +608,7 @@ def apply_loudnorm_two_pass(
             "-i", str(input_path),
             "-c:v", "copy",
             "-af", filter_str,
-            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            "-c:a", "aac", "-b:a", AAC_BITRATE, "-ar", AAC_SAMPLE_RATE,
             "-movflags", "+faststart",
             str(output_path),
         ]
@@ -635,7 +640,7 @@ def apply_loudnorm_two_pass(
         "-i", str(input_path),
         "-c:v", "copy",
         "-af", filter_str,
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-c:a", "aac", "-b:a", AAC_BITRATE, "-ar", AAC_SAMPLE_RATE,
         "-movflags", "+faststart",
         str(output_path),
     ]
